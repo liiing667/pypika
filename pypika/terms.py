@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import inspect
 import json
+import math
 import re
 import sys
 import uuid
@@ -579,40 +580,68 @@ class ParameterValueWrapper(ValueWrapper):
 class JSON(Term):
     table: str | Selectable | None = None
 
+    # Only JSON-native value types are accepted. Anything else (custom objects,
+    # bytes, sets, ...) must fail loudly instead of being stringified into the
+    # SQL literal, where its content could break out of the JSON text.
+    _SUPPORTED_TYPES = (dict, list, tuple, str, int, float, bool, type(None))
+    _SUPPORTED_KEY_TYPES = (str, int, float, bool, type(None))
+
     def __init__(self, value: Any = None, alias: str | None = None) -> None:
         super().__init__(alias)
         self.value = value
 
-    def _recursive_get_sql(self, value: Any, **kwargs: Any) -> str:
+    @classmethod
+    def _validate_value(cls, value: Any) -> None:
         if isinstance(value, dict):
-            return self._get_dict_sql(value, **kwargs)
-        if isinstance(value, list):
-            return self._get_list_sql(value, **kwargs)
-        if isinstance(value, str):
-            return self._get_str_sql(value, **kwargs)
-        if isinstance(value, bool):
-            return str(value).lower()
-        if value is None:
-            return "null"
-        return str(value)
+            for key, item in value.items():
+                if not isinstance(key, cls._SUPPORTED_KEY_TYPES):
+                    raise TypeError(
+                        "JSON object keys must be str, int, float, bool or None, got {type}".format(
+                            type=type(key).__name__
+                        )
+                    )
+                cls._validate_value(item)
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                cls._validate_value(item)
+        elif isinstance(value, cls._SUPPORTED_TYPES):
+            if isinstance(value, float) and not math.isfinite(value):
+                raise TypeError("JSON does not support non-finite float values: {value}".format(value=value))
+        else:
+            raise TypeError(
+                "JSON values must be dict, list, tuple, str, int, float, bool or None, got {type}".format(
+                    type=type(value).__name__
+                )
+            )
 
-    def _get_dict_sql(self, value: dict, **kwargs: Any) -> str:
-        pairs = [
-            "{key}:{value}".format(key=self._recursive_get_sql(k, **kwargs), value=self._recursive_get_sql(v, **kwargs))
-            for k, v in value.items()
-        ]
-        return "".join(["{", ",".join(pairs), "}"])
+    def _get_json_text(self) -> str:
+        # json.dumps performs the full, unambiguous JSON encoding: strings are
+        # quoted and escaped, keys are coerced to strings, bool/None render as
+        # true/false/null and tuples serialize as arrays. The validation above
+        # guarantees that no unsupported object reaches the encoder.
+        self._validate_value(self.value)
+        return json.dumps(self.value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
 
-    def _get_list_sql(self, value: list, **kwargs: Any) -> str:
-        pairs = [self._recursive_get_sql(v, **kwargs) for v in value]
-        return "".join(["[", ",".join(pairs), "]"])
+    def get_sql(
+        self,
+        secondary_quote_char: str = "'",
+        parameter: Parameter = None,
+        **kwargs: Any,
+    ) -> str:
+        json_text = self._get_json_text()
 
-    @staticmethod
-    def _get_str_sql(value: str, **kwargs: Any) -> str:
-        return json.dumps(value, ensure_ascii=False)
+        if parameter is not None:
+            # A bound parameter carries the raw JSON text, so SQL-literal
+            # escaping (backslash doubling, quote doubling) must not be applied.
+            param_sql = parameter.get_sql(**kwargs)
+            parameter.update_parameters(
+                param_key=parameter.get_param_key(placeholder=param_sql),
+                value=json_text,
+                **kwargs,
+            )
+            return format_alias_sql(param_sql, self.alias, **kwargs)
 
-    def get_sql(self, secondary_quote_char: str = "'", **kwargs: Any) -> str:
-        value = escape_backslashes(self._recursive_get_sql(self.value), kwargs.get("dialect"))
+        value = escape_backslashes(json_text, kwargs.get("dialect"))
         sql = format_quotes(value, secondary_quote_char)
         return format_alias_sql(sql, self.alias, **kwargs)
 

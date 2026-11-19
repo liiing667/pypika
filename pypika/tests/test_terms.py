@@ -1,8 +1,10 @@
 from unittest import TestCase
 
+import json
+
 from pypika import JSON, Field, Query, Table
 from pypika.dialects import ClickHouseQuery, MSSQLQuery, MySQLQuery, PostgreSQLQuery, SQLLiteQuery
-from pypika.terms import AtTimezone
+from pypika.terms import AtTimezone, FormatParameter, NamedParameter, QmarkParameter
 
 
 class FieldAliasTests(TestCase):
@@ -204,3 +206,145 @@ class JSONStringEscapingTests(TestCase):
         for query_cls in (MySQLQuery, ClickHouseQuery):
             with self.subTest(dialect=query_cls.__name__):
                 self.assertEqual(r"""SELECT '"a\\"b\\\\c\\n"'""", str(query_cls.select(JSON(value))))
+
+
+class JSONEncodingTests(TestCase):
+    def test_scalar_types_are_json_encoded(self):
+        self.assertEqual("""SELECT 'null'""", str(PostgreSQLQuery.select(JSON(None))))
+        self.assertEqual("""SELECT 'true'""", str(PostgreSQLQuery.select(JSON(True))))
+        self.assertEqual("""SELECT 'false'""", str(PostgreSQLQuery.select(JSON(False))))
+        self.assertEqual("""SELECT '1'""", str(PostgreSQLQuery.select(JSON(1))))
+        self.assertEqual("""SELECT '1.5'""", str(PostgreSQLQuery.select(JSON(1.5))))
+        self.assertEqual("""SELECT '"str"'""", str(PostgreSQLQuery.select(JSON("str"))))
+
+    def test_nested_arrays_are_preserved(self):
+        query = PostgreSQLQuery.select(JSON([1, [2, [3, [4]]]]))
+
+        self.assertEqual("""SELECT '[1,[2,[3,[4]]]]'""", str(query))
+
+    def test_tuple_values_are_encoded_as_arrays(self):
+        query = PostgreSQLQuery.select(JSON([1, (2, [3, (4,)])]))
+
+        self.assertEqual("""SELECT '[1,[2,[3,[4]]]]'""", str(query))
+
+    def test_non_string_keys_are_coerced_to_json_strings(self):
+        cases = [
+            ({1: "a"}, {"1": "a"}),
+            ({2.5: "b"}, {"2.5": "b"}),
+            ({True: "c"}, {"true": "c"}),
+            ({None: "d"}, {"null": "d"}),
+        ]
+        for value, expected in cases:
+            with self.subTest(value=value):
+                query = PostgreSQLQuery.select(JSON(value))
+                self.assertEqual(expected, json.loads(str(query)[len("SELECT '") : -1]))
+
+    def test_every_dialect_produces_parseable_json(self):
+        value = {"a\"b": [{"c\\d": "it's\nready"}], "n": [1, True, None, 1.5]}
+        for query_cls in (Query, PostgreSQLQuery, SQLLiteQuery, MSSQLQuery, MySQLQuery, ClickHouseQuery):
+            with self.subTest(dialect=query_cls.__name__):
+                sql = str(query_cls.select(JSON(value)))
+                literal = sql[len("SELECT ") :]
+                quote = literal[0]
+                text = literal[1:-1].replace(quote * 2, quote)
+                if query_cls in (MySQLQuery, ClickHouseQuery):
+                    text = text.replace("\\\\", "\\")
+                self.assertEqual(value, json.loads(text))
+
+
+class JSONUnsupportedTypeTests(TestCase):
+    class CustomScalar:
+        def __str__(self):
+            return 'x"); DROP TABLE t; --'
+
+    def test_custom_scalar_in_list_is_rejected(self):
+        with self.assertRaises(TypeError):
+            str(PostgreSQLQuery.select(JSON([self.CustomScalar()])))
+
+    def test_custom_scalar_as_dict_value_is_rejected(self):
+        with self.assertRaises(TypeError):
+            str(PostgreSQLQuery.select(JSON({"a": self.CustomScalar()})))
+
+    def test_custom_dict_key_is_rejected(self):
+        with self.assertRaises(TypeError):
+            str(PostgreSQLQuery.select(JSON({self.CustomScalar(): 1})))
+
+    def test_unsupported_nested_object_is_rejected(self):
+        for value in ({"a": {1, 2}}, [b"bytes"], {"a": {"b": object()}}):
+            with self.subTest(value=value):
+                with self.assertRaises(TypeError):
+                    str(PostgreSQLQuery.select(JSON(value)))
+
+    def test_non_finite_float_is_rejected(self):
+        for value in (float("nan"), float("inf"), float("-inf")):
+            with self.subTest(value=value):
+                with self.assertRaises(TypeError):
+                    str(PostgreSQLQuery.select(JSON([value])))
+
+    def test_rejected_value_never_renders_its_str_content(self):
+        payload = self.CustomScalar()
+        with self.assertRaises(TypeError):
+            str(PostgreSQLQuery.select(JSON({"k": [payload]})))
+
+
+class JSONInjectionContainmentTests(TestCase):
+    def test_quotes_and_comments_cannot_escape_literal(self):
+        attacks = ['" OR 1=1 --', "')); DROP TABLE users; --", "a\\", "\\'", "/* */", 'a"b']
+        for attack in attacks:
+            with self.subTest(attack=attack):
+                sql = str(PostgreSQLQuery.select(JSON({"k": [attack]})))
+                text = sql[len("SELECT '") : -1].replace("''", "'")
+                self.assertEqual({"k": [attack]}, json.loads(text))
+
+    def test_attack_in_dict_key_is_quoted(self):
+        sql = str(PostgreSQLQuery.select(JSON({'" OR 1=1 --': "v"})))
+
+        self.assertEqual("""SELECT '{"\\" OR 1=1 --":"v"}'""", sql)
+
+
+class JSONParameterTests(TestCase):
+    def test_qmark_parameter_binds_raw_json_text(self):
+        parameter = QmarkParameter()
+        sql = Query.into(Table("t")).insert(JSON({"a": [1, True, None], "b": "x"})).get_sql(parameter=parameter)
+
+        self.assertEqual('INSERT INTO "t" VALUES (?)', sql)
+        self.assertEqual(['{"a":[1,true,null],"b":"x"}'], parameter.get_parameters())
+
+    def test_named_parameter_binds_raw_json_text(self):
+        parameter = NamedParameter("payload")
+        sql = Query.into(Table("t")).insert(JSON({"a": "b"})).get_sql(parameter=parameter)
+
+        self.assertEqual('INSERT INTO "t" VALUES (:payload)', sql)
+        self.assertEqual({"payload": '{"a":"b"}'}, parameter.get_parameters())
+
+    def test_format_parameter_keeps_un_escaped_backslashes(self):
+        parameter = FormatParameter()
+        sql = MySQLQuery.into(Table("t")).insert(JSON({"a": "b\\c"})).get_sql(parameter=parameter)
+
+        self.assertEqual("INSERT INTO `t` VALUES (%s)", sql)
+        self.assertEqual(['{"a":"b\\\\c"}'], parameter.get_parameters())
+
+    def test_inline_literal_still_escapes_backslashes_for_mysql(self):
+        sql = str(MySQLQuery.select(JSON({"a": "b\\c"})))
+
+        self.assertEqual("""SELECT '{"a":"b\\\\\\\\c"}'""", sql)
+
+    def test_parameter_mode_keeps_alias(self):
+        parameter = QmarkParameter()
+        sql = Query.select(JSON({"a": "b"}).as_("payload")).get_sql(parameter=parameter)
+
+        self.assertEqual('SELECT ? "payload"', sql)
+        self.assertEqual(['{"a":"b"}'], parameter.get_parameters())
+
+    def test_unsupported_value_is_rejected_in_parameter_mode(self):
+        parameter = QmarkParameter()
+        with self.assertRaises(TypeError):
+            Query.into(Table("t")).insert(JSON([object()])).get_sql(parameter=parameter)
+        self.assertEqual([], parameter.get_parameters())
+
+
+class JSONAliasTests(TestCase):
+    def test_alias_is_preserved_for_nested_value(self):
+        query = PostgreSQLQuery.select(JSON({"a": {"b": [1, 2]}}).as_("payload"))
+
+        self.assertEqual("""SELECT '{"a":{"b":[1,2]}}' "payload\"""", str(query))
