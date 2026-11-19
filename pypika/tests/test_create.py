@@ -1,6 +1,6 @@
 import unittest
 
-from pypika import Column, Columns, Query, Table, Tables
+from pypika import Column, Columns, Query, RawSQL, Table, Tables
 from pypika.enums import ReferenceOption, SqlTypes
 from pypika.terms import Index, ValueWrapper
 
@@ -176,40 +176,83 @@ class CreateTableTests(unittest.TestCase):
         with self.assertRaises(TypeError):
             Query.create_table(self.new_table).as_select("abc")
 
+    def test_create_table_with_foreign_key_string_reference_table(self):
+        cref, dref = Columns(("c", "INT"), ("d", "VARCHAR(100)"))
+        q = Query.create_table(self.new_table).columns(self.foo, self.bar).foreign_key(
+            [self.foo, self.bar], "efg", [cref, dref]
+        )
+
+        self.assertEqual(
+            'CREATE TABLE "abc" ('
+            '"a" INT,'
+            '"b" VARCHAR(100),'
+            'FOREIGN KEY ("a","b") REFERENCES "efg" ("c","d"))',
+            str(q),
+        )
+
+    def test_create_table_with_invalid_column_name_raises_error(self):
+        q = Query.create_table(self.new_table).columns(Column('a"; DROP TABLE users; --', "INT"))
+
+        with self.assertRaises(ValueError):
+            q.get_sql()
+
+    def test_create_table_with_invalid_period_for_name_raises_error(self):
+        q = Query.create_table(self.new_table).columns(Column("valid_from", "DATETIME"), Column("valid_to", "DATETIME"))
+        q = q.period_for('valid_period"; DROP TABLE users; --', "valid_from", "valid_to")
+
+        with self.assertRaises(ValueError):
+            q.get_sql()
+
+    def test_create_table_with_invalid_column_type_raises_error(self):
+        q = Query.create_table(self.new_table).columns(Column("a", "INT); DROP TABLE users; --"))
+
+        with self.assertRaises(ValueError):
+            q.get_sql()
+
+    def test_create_table_with_raw_sql_column_type(self):
+        q = Query.create_table(self.new_table).columns(Column("a", RawSQL("INT[]")))
+
+        self.assertEqual('CREATE TABLE "abc" ("a" INT[])', str(q))
+
 
 class CreateIndexTests(unittest.TestCase):
     new_index = Index("abc")
     new_table = Table("my_table")
     columns = (new_table.a, new_table.b)
     where = new_table.a > 1
+    columns_sql = ", ".join('"{}"'.format(c.name) for c in columns)
 
     def test_create_index_simple(self) -> None:
         q = Query.create_index(self.new_index).on(self.new_table).columns(*self.columns)
         self.assertEqual(
-            f'CREATE INDEX "{self.new_index.name}" ON "{self.new_table.get_table_name()}"({", ".join([c.name for c in self.columns])})',
+            f'CREATE INDEX "{self.new_index.name}" ON "{self.new_table.get_table_name()}"({self.columns_sql})',
             q.get_sql(),
         )
 
     def test_create_index_where(self) -> None:
         q = Query.create_index(self.new_index).on(self.new_table).columns(*self.columns).where(self.where)
         self.assertEqual(
-            f'CREATE INDEX "{self.new_index.name}" ON "{self.new_table.get_table_name()}"({", ".join([c.name for c in self.columns])}) WHERE {self.where.get_sql()}',
+            f'CREATE INDEX "{self.new_index.name}" ON "{self.new_table.get_table_name()}"({self.columns_sql}) WHERE {self.where.get_sql()}',
             q.get_sql(),
         )
 
     def test_create_index_unique(self) -> None:
         q = Query.create_index(self.new_index).on(self.new_table).columns(*self.columns).unique()
         self.assertEqual(
-            f'CREATE UNIQUE INDEX "{self.new_index.name}" ON "{self.new_table.get_table_name()}"({", ".join([c.name for c in self.columns])})',
+            f'CREATE UNIQUE INDEX "{self.new_index.name}" ON "{self.new_table.get_table_name()}"({self.columns_sql})',
             q.get_sql(),
         )
 
     def test_create_index_if_not_exists(self) -> None:
         q = Query.create_index(self.new_index).on(self.new_table).columns(*self.columns).if_not_exists()
         self.assertEqual(
-            f'CREATE INDEX IF NOT EXISTS "{self.new_index.name}" ON "{self.new_table.get_table_name()}"({", ".join([c.name for c in self.columns])})',
+            f'CREATE INDEX IF NOT EXISTS "{self.new_index.name}" ON "{self.new_table.get_table_name()}"({self.columns_sql})',
             q.get_sql(),
         )
+
+    def test_create_index_with_string_identifiers(self) -> None:
+        q = Query.create_index("myidx").on("my_table").columns("a", "b")
+        self.assertEqual('CREATE INDEX "myidx" ON "my_table"("a", "b")', q.get_sql())
 
     def test_create_index_without_columns_raises_error(self) -> None:
         with self.assertRaises(AttributeError):
@@ -218,3 +261,18 @@ class CreateIndexTests(unittest.TestCase):
     def test_create_index_without_table_raises_error(self) -> None:
         with self.assertRaises(AttributeError):
             Query.create_index(self.new_index).columns(*self.columns).get_sql()
+
+    def test_create_index_with_invalid_index_name_raises_error(self) -> None:
+        q = Query.create_index('idx"; DROP TABLE users; --').on(self.new_table).columns("a")
+        with self.assertRaises(ValueError):
+            q.get_sql()
+
+    def test_create_index_with_invalid_table_name_raises_error(self) -> None:
+        q = Query.create_index("idx").on('my_table"; DROP TABLE users; --').columns("a")
+        with self.assertRaises(ValueError):
+            q.get_sql()
+
+    def test_create_index_with_invalid_column_name_raises_error(self) -> None:
+        q = Query.create_index("idx").on(self.new_table).columns('a"); DROP TABLE users; --')
+        with self.assertRaises(ValueError):
+            q.get_sql()

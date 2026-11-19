@@ -26,7 +26,7 @@ from pypika.terms import (
     Term,
     ValueWrapper,
 )
-from pypika.utils import QueryException, builder, format_alias_sql, format_quotes
+from pypika.utils import QueryException, builder, format_alias_sql, format_identifier, format_quotes
 
 
 class SnowflakeQuery(Query):
@@ -934,7 +934,7 @@ class ClickHouseDropQueryBuilder(DropQueryBuilder):
         query = super().get_sql(**kwargs)
 
         if self._drop_target_kind != "DICTIONARY" and self._cluster_name is not None:
-            query += " ON CLUSTER " + format_quotes(self._cluster_name, super().QUOTE_CHAR)
+            query += " ON CLUSTER " + format_identifier(self._cluster_name, self.QUOTE_CHAR)
 
         return query
 

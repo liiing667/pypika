@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 from collections.abc import Sequence
 from copy import copy
@@ -30,6 +31,7 @@ from pypika.utils import (
     SetOperationException,
     builder,
     format_alias_sql,
+    format_identifier,
     format_quotes,
     ignore_copy,
 )
@@ -315,6 +317,29 @@ def make_tables(*names: tuple[str, str] | str, **kwargs: Any) -> list[Table]:
     return tables
 
 
+class RawSQL:
+    """
+    An explicitly marked raw SQL fragment.
+
+    DDL builders validate structural values (identifiers, column types) before
+    rendering them.  Callers who genuinely need a raw SQL extension (e.g. a
+    vendor-specific column type) can wrap it in ``RawSQL`` to mark the
+    passthrough as intentional; the fragment is then emitted verbatim.
+    """
+
+    def __init__(self, sql: str) -> None:
+        self.sql = sql
+
+    def get_sql(self, **kwargs: Any) -> str:
+        return self.sql
+
+    def __str__(self) -> str:
+        return self.sql
+
+
+SAFE_COLUMN_TYPE_PATTERN = re.compile(r"^[A-Za-z0-9_ (),\[\]]+$")
+
+
 class Column:
     """Represents a column."""
 
@@ -334,15 +359,31 @@ class Column:
         quote_char = kwargs.get("quote_char")
 
         column_sql = "{name}".format(
-            name=format_quotes(self.name, quote_char),
+            name=format_identifier(self.name, quote_char),
         )
 
         return column_sql
 
+    def get_type_sql(self, **kwargs: Any) -> str:
+        if not self.type:
+            return ""
+
+        if isinstance(self.type, RawSQL):
+            return " " + self.type.get_sql(**kwargs)
+
+        type_sql = self.type.get_sql(**kwargs) if hasattr(self.type, "get_sql") else str(self.type)
+        if not SAFE_COLUMN_TYPE_PATTERN.match(type_sql):
+            raise ValueError(
+                "Invalid column type: {type!r}. Wrap vendor-specific types in RawSQL to emit them verbatim.".format(
+                    type=type_sql
+                )
+            )
+        return " " + type_sql
+
     def get_sql(self, **kwargs: Any) -> str:
         column_sql = "{name}{type}{nullable}{default}".format(
             name=self.get_name_sql(**kwargs),
-            type=" {}".format(self.type) if self.type else "",
+            type=self.get_type_sql(**kwargs),
             nullable=" {}".format("NULL" if self.nullable else "NOT NULL") if self.nullable is not None else "",
             default=" {}".format("DEFAULT " + self.default.get_sql(**kwargs)) if self.default else "",
         )
@@ -380,7 +421,7 @@ class PeriodFor:
         quote_char = kwargs.get("quote_char")
 
         period_for_sql = "PERIOD FOR {name} ({start_column_name},{end_column_name})".format(
-            name=format_quotes(self.name, quote_char),
+            name=format_identifier(self.name, quote_char),
             start_column_name=self.start_column.get_name_sql(**kwargs),
             end_column_name=self.end_column.get_name_sql(**kwargs),
         )
@@ -2033,7 +2074,9 @@ class CreateQueryBuilder:
         if self._foreign_key:
             raise AttributeError("'Query' object already has attribute foreign_key")
         self._foreign_key = self._prepare_columns_input(columns)
-        self._foreign_key_reference_table = reference_table
+        self._foreign_key_reference_table = (
+            reference_table if isinstance(reference_table, Table) else Table(reference_table)
+        )
         self._foreign_key_reference = self._prepare_columns_input(reference_columns)
         self._foreign_key_on_delete = on_delete
         self._foreign_key_on_update = on_update
@@ -2172,13 +2215,28 @@ class CreateQueryBuilder:
 
 
 class CreateIndexBuilder:
-    def __init__(self) -> None:
+    """
+    Query builder used to build CREATE INDEX queries.
+    """
+
+    QUOTE_CHAR = '"'
+    SECONDARY_QUOTE_CHAR = "'"
+    ALIAS_QUOTE_CHAR = None
+    QUERY_CLS = Query
+
+    def __init__(self, dialect: Dialects | None = None) -> None:
         self._index = None
         self._columns = []
         self._table = None
         self._wheres = None
         self._is_unique = False
         self._if_not_exists = False
+        self.dialect = dialect
+
+    def _set_kwargs_defaults(self, kwargs: dict) -> None:
+        kwargs.setdefault("quote_char", self.QUOTE_CHAR)
+        kwargs.setdefault("secondary_quote_char", self.SECONDARY_QUOTE_CHAR)
+        kwargs.setdefault("dialect", self.dialect)
 
     @builder
     def create_index(self, index: str | Index) -> None:
@@ -2215,18 +2273,40 @@ class CreateIndexBuilder:
     def if_not_exists(self) -> None:
         self._if_not_exists = True
 
-    def get_sql(self) -> str:
+    def get_sql(self, **kwargs: Any) -> str:
+        self._set_kwargs_defaults(kwargs)
+
         if not self._columns or len(self._columns) == 0:
             raise AttributeError("Cannot create index without columns")
         if not self._table:
             raise AttributeError("Cannot create index without table")
-        columns_str = ", ".join([c.name for c in self._columns])
-        unique_str = "UNIQUE" if self._is_unique else ""
-        if_not_exists_str = "IF NOT EXISTS" if self._if_not_exists else ""
-        base_sql = f"CREATE {unique_str} INDEX {if_not_exists_str} {self._index} ON {self._table}({columns_str})"
+
+        quote_char = kwargs.get("quote_char")
+        index_sql = format_identifier(self._index.name if isinstance(self._index, Index) else self._index, quote_char)
+        table_sql = (
+            self._table.get_sql(**kwargs)
+            if isinstance(self._table, Table)
+            else format_identifier(self._table, quote_char)
+        )
+        columns_str = ", ".join(self._column_name_sql(column, quote_char) for column in self._columns)
+
+        parts = ["CREATE"]
+        if self._is_unique:
+            parts.append("UNIQUE")
+        parts.append("INDEX")
+        if self._if_not_exists:
+            parts.append("IF NOT EXISTS")
+        parts.extend([index_sql, "ON", table_sql])
+
+        base_sql = "{head}({columns})".format(head=" ".join(parts), columns=columns_str)
         if self._wheres:
-            base_sql += f" WHERE {self._wheres}"
-        return base_sql.replace("  ", " ")
+            base_sql += " WHERE {where}".format(where=self._wheres.get_sql(**kwargs))
+        return base_sql
+
+    @staticmethod
+    def _column_name_sql(column: Any, quote_char: str | None) -> str:
+        name = column.name if isinstance(column, (Column, Field)) else str(column)
+        return format_identifier(name, quote_char)
 
     def __str__(self) -> str:
         return self.get_sql()
@@ -2297,7 +2377,7 @@ class DropQueryBuilder:
         if isinstance(self._drop_target, (Database, Table)):
             target_name = self._drop_target.get_sql(**kwargs)
         else:
-            target_name = format_quotes(self._drop_target, self.QUOTE_CHAR)
+            target_name = format_identifier(self._drop_target, kwargs.get("quote_char"))
 
         return "DROP {kind} {if_exists}{name}".format(
             kind=self._drop_target_kind, if_exists=if_exists, name=target_name

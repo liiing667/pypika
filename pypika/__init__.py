@@ -71,6 +71,7 @@ from pypika.queries import (
     Column,
     Database,
     Query,
+    RawSQL,
     Schema,
     Table,
 )
@@ -141,6 +142,7 @@ __all__ = (
     'Order',
     'AliasedQuery',
     'Query',
+    'RawSQL',
     'Schema',
     'Table',
     'Column',

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 from collections.abc import Callable
 from functools import wraps
@@ -132,6 +133,25 @@ def format_quotes(value: Any, quote_char: str | None) -> str:
         value = str(value).replace(quote_char, quote_char * 2)
 
     return "{quote}{value}{quote}".format(value=value, quote=quote_char or "")
+
+
+SAFE_IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*(\.[A-Za-z_][A-Za-z0-9_$]*)*$")
+
+
+def format_identifier(value: Any, quote_char: str | None) -> str:
+    """
+    Formats a structural identifier (table, column, index, ... names) for DDL
+    statements, quoting it with the dialect's quote character.
+
+    Unlike ``format_quotes``, which emits any value, structural identifiers are
+    validated against a conservative character set so that a caller-controlled
+    name cannot terminate the statement and append SQL.  Anything outside the
+    safe set raises ``ValueError`` when the statement is rendered.
+    """
+    value = str(value)
+    if not SAFE_IDENTIFIER_PATTERN.match(value):
+        raise ValueError("Invalid identifier: {value!r}".format(value=value))
+    return format_quotes(value, quote_char)
 
 
 def escape_backslashes(value: str, dialect: Dialects | None) -> str:

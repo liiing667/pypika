@@ -47,3 +47,15 @@ class DropTableTests(unittest.TestCase):
 
         self.assertEqual('DROP INDEX "myindex"', str(q1))
         self.assertEqual('DROP INDEX IF EXISTS "myindex"', str(q2))
+
+    def test_drop_user_with_invalid_name_raises_error(self):
+        with self.assertRaises(ValueError):
+            Query.drop_user('myuser"; DROP TABLE users; --').get_sql()
+
+    def test_drop_view_with_invalid_name_raises_error(self):
+        with self.assertRaises(ValueError):
+            Query.drop_view('myview"; DROP TABLE users; --').get_sql()
+
+    def test_drop_index_with_invalid_name_raises_error(self):
+        with self.assertRaises(ValueError):
+            Query.drop_index('myindex"; DROP TABLE users; --').get_sql()
