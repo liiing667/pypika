@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 from collections.abc import Callable
 from functools import wraps
@@ -47,6 +48,20 @@ class DialectNotSupported(Exception):
 
 class FunctionException(Exception):
     pass
+
+
+VALID_IDENTIFIER_REGEX = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def is_valid_identifier(value: Any) -> bool:
+    """
+    Checks whether a value is a valid SQL identifier, allowing dot-separated
+    namespaces (e.g. "my_schema.my_function"). Each part must start with a
+    letter or underscore and contain only letters, digits and underscores.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    return all(VALID_IDENTIFIER_REGEX.match(part) is not None for part in value.split("."))
 
 
 _Self = TypeVar("_Self")

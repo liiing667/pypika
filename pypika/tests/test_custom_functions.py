@@ -7,6 +7,15 @@ __email__ = "me@airton.dev"
 
 
 class TestUnitCustomFunction(unittest.TestCase):
+    def test_should_fail_with_invalid_function_name(self):
+        with self.assertRaises(FunctionException):
+            CustomFunction("count(*) FROM secrets --")
+
+    def test_should_allow_namespaced_function_name(self):
+        Namespaced = CustomFunction("my_schema.MY_FUNC", ["param"])
+
+        self.assertEqual("my_schema.MY_FUNC('a')", str(Namespaced("a")))
+
     def test_should_fail_with_wrong_arguments(self):
         DateDiff = CustomFunction("DATE_DIFF", ["interval", "start_date", "end_date"])
 

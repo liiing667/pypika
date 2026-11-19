@@ -22,6 +22,7 @@ from pypika.utils import (
     format_alias_sql,
     format_quotes,
     ignore_copy,
+    is_valid_identifier,
     resolve_is_aggregate,
 )
 
@@ -1534,8 +1535,28 @@ class All(Criterion):
         return format_alias_sql(sql, self.alias, **kwargs)
 
 
+def _validate_function_name(name: str) -> None:
+    if not is_valid_identifier(name):
+        raise FunctionException(
+            "Invalid function name {name!r}: function names must be valid SQL identifiers "
+            "(letters, digits and underscores, optionally dot-separated for namespaces)".format(name=name)
+        )
+
+
+def _validate_function_schema(schema: Any) -> None:
+    while schema is not None:
+        name = schema if isinstance(schema, str) else getattr(schema, "_name", None)
+        if not is_valid_identifier(name):
+            raise FunctionException(
+                "Invalid schema name {name!r}: schema names must be valid SQL identifiers "
+                "(letters, digits and underscores)".format(name=name)
+            )
+        schema = None if isinstance(schema, str) else getattr(schema, "_parent", None)
+
+
 class CustomFunction:
     def __init__(self, name: str, params: Sequence | None = None) -> None:
+        _validate_function_name(name)
         self.name = name
         self.params = params
 
@@ -1564,9 +1585,12 @@ class CustomFunction:
 class Function(Criterion):
     def __init__(self, name: str, *args: Any, **kwargs: Any) -> None:
         super().__init__(kwargs.get("alias"))
+        _validate_function_name(name)
         self.name = name
         self.args = [self.wrap_constant(param) for param in args]
         self.schema = kwargs.get("schema")
+        if self.schema is not None:
+            _validate_function_schema(self.schema)
 
     def nodes_(self) -> Iterator[NodeT]:
         yield self
@@ -1626,7 +1650,6 @@ class Function(Criterion):
         quote_char = kwargs.pop("quote_char", None)
         dialect = kwargs.pop("dialect", None)
 
-        # FIXME escape
         function_sql = self.get_function_sql(with_namespace=with_namespace, quote_char=quote_char, dialect=dialect)
 
         if self.schema is not None:

@@ -15,6 +15,7 @@ from pypika import Table as T
 from pypika import functions as fn
 from pypika.enums import Dialects, SqlTypes
 from pypika.terms import QmarkParameter, ValueWrapper
+from pypika.utils import FunctionException
 
 __author__ = "Timothy Heys"
 __email__ = "theys@kayak.com"
@@ -46,6 +47,52 @@ class SchemaTests(unittest.TestCase):
         func = fn.Function("my_proc", 1, 2, 3, schema=a)
 
         self.assertEqual('"a".my_proc(1,2,3)', func.get_sql(quote_char='"'))
+
+
+class FunctionNameValidationTests(unittest.TestCase):
+    def test_function_name_cannot_break_out_of_call(self):
+        with self.assertRaises(FunctionException):
+            fn.Function("count(*) FROM secrets --")
+
+    def test_function_name_with_quotes_rejected(self):
+        with self.assertRaises(FunctionException):
+            fn.Function('x"); DROP TABLE users;--')
+
+    def test_function_name_with_spaces_rejected(self):
+        with self.assertRaises(FunctionException):
+            fn.Function("not a function")
+
+    def test_empty_function_name_rejected(self):
+        with self.assertRaises(FunctionException):
+            fn.Function("")
+
+    def test_function_name_starting_with_digit_rejected(self):
+        with self.assertRaises(FunctionException):
+            fn.Function("1func")
+
+    def test_namespaced_function_name_allowed(self):
+        func = fn.Function("my_schema.my_func", 1)
+
+        self.assertEqual("my_schema.my_func(1)", func.get_sql())
+
+    def test_legal_custom_function_name_allowed(self):
+        t = T("users")
+        q = Q.from_(t).select(fn.Function("my_custom_fn", t.id))
+
+        self.assertEqual('SELECT my_custom_fn("id") FROM "users"', str(q))
+
+    def test_invalid_schema_name_rejected(self):
+        with self.assertRaises(FunctionException):
+            fn.Function("my_proc", 1, schema=Schema('a"."b'))
+
+    def test_invalid_schema_parent_name_rejected(self):
+        with self.assertRaises(FunctionException):
+            fn.Function("my_proc", 1, schema=Schema("a", parent=Schema("b --")))
+
+    def test_arguments_still_use_literal_values(self):
+        func = fn.Function("func", "a'; DROP TABLE users;--", 1)
+
+        self.assertEqual("func('a''; DROP TABLE users;--',1)", func.get_sql())
 
 
 class ArithmeticTests(unittest.TestCase):
