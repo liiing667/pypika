@@ -1407,3 +1407,67 @@ class QuoteTests(unittest.TestCase):
             "SELECT t1.value FROM table1 t1 " "JOIN table2 t2 ON t1.Value " "BETWEEN t2.start AND t2.end",
             query.get_sql(quote_char=None),
         )
+
+
+class TenantFilterIsolationTests(unittest.TestCase):
+    table = Table("orders")
+
+    def test_optional_or_condition_is_always_parenthesized(self):
+        tenant = self.table.tenant_id == 42
+        optional = (self.table.is_public == True) | (self.table.owner_id == 7)
+
+        query = Query.from_(self.table).select("*").where(tenant).where(optional)
+
+        self.assertEqual(
+            'SELECT * FROM "orders" WHERE "tenant_id"=42 AND ("is_public"=true OR "owner_id"=7)',
+            str(query),
+        )
+
+    def test_grouped_tenant_filter_keeps_explicit_parentheses(self):
+        tenant = (self.table.tenant_id == 42).group()
+        optional = (self.table.is_public == True) | (self.table.owner_id == 7)
+
+        query = Query.from_(self.table).select("*").where(tenant).where(optional)
+
+        self.assertEqual(
+            'SELECT * FROM "orders" WHERE ("tenant_id"=42) AND ("is_public"=true OR "owner_id"=7)',
+            str(query),
+        )
+
+    def test_conflicting_where_fails_instead_of_dropping_tenant_filter(self):
+        tenant = self.table.tenant_id == 42
+
+        with self.assertRaises(QueryException):
+            Query.from_(self.table).select("*").where(tenant).where(~tenant)
+
+    def test_empty_optional_criterion_leaves_tenant_filter_intact(self):
+        tenant = self.table.tenant_id == 42
+
+        query = Query.from_(self.table).select("*").where(tenant).where(EmptyCriterion())
+
+        self.assertEqual('SELECT * FROM "orders" WHERE "tenant_id"=42', str(query))
+
+    def test_negated_empty_optional_criterion_leaves_tenant_filter_intact(self):
+        tenant = self.table.tenant_id == 42
+
+        query = Query.from_(self.table).select("*").where(tenant).where(~EmptyCriterion())
+
+        self.assertEqual('SELECT * FROM "orders" WHERE "tenant_id"=42', str(query))
+
+    def test_optional_or_on_join_keeps_tenant_filter_in_where(self):
+        users = Table("users")
+        tenant = self.table.tenant_id == 42
+        optional = (self.table.owner_id == users.id) | (self.table.backup_id == users.id)
+
+        query = (
+            Query.from_(self.table)
+            .join(users)
+            .on(self.table.owner_id == users.id)
+            .select("*")
+            .where(tenant)
+            .where(optional)
+        )
+
+        sql = str(query)
+        self.assertIn('WHERE "orders"."tenant_id"=42 AND', sql)
+        self.assertIn('("orders"."owner_id"="users"."id" OR "orders"."backup_id"="users"."id")', sql)

@@ -17,7 +17,10 @@ from pypika import (
     functions as fn,
 )
 from pypika.queries import QueryBuilder
-from pypika.terms import ExistsCriterion, Mod, ValueWrapper
+from pypika.dialects import ClickHouseQuery
+from pypika.enums import Boolean
+from pypika.terms import ExistsCriterion, Mod, NestedCriterion, Not, ValueWrapper
+from pypika.utils import QueryException
 
 __author__ = "Timothy Heys"
 __email__ = "theys@kayak.com"
@@ -1194,3 +1197,290 @@ class FilteredAggregateReplaceTableTests(unittest.TestCase):
         original = fn.Sum(self.old.pnl).filter(self.old.side == "BUY")
         replaced = original.replace_table(Table("unrelated"), self.new)
         self.assertEqual(str(replaced), str(original))
+
+
+class ExplicitGroupingTests(unittest.TestCase):
+    table = Table("orders")
+
+    def test_group_wraps_criterion_in_parentheses(self):
+        criterion = (Field("a") == 1) | (Field("b") == 2)
+
+        self.assertEqual('("a"=1 OR "b"=2)', str(criterion.group()))
+        self.assertIsInstance(criterion.group(), NestedCriterion)
+
+    def test_group_is_preserved_through_and_combination(self):
+        tenant = (self.table.tenant_id == 42).group()
+        optional = (self.table.is_public == True) | (self.table.owner_id == 7)
+
+        query = Query.from_(self.table).select("*").where(tenant).where(optional)
+
+        self.assertEqual(
+            'SELECT * FROM "orders" WHERE ("tenant_id"=42) AND ("is_public"=true OR "owner_id"=7)',
+            query.get_sql(),
+        )
+
+    def test_group_survives_reversed_where_order(self):
+        tenant = (self.table.tenant_id == 42).group()
+        optional = (self.table.is_public == True) | (self.table.owner_id == 7)
+
+        query = Query.from_(self.table).select("*").where(optional).where(tenant)
+
+        self.assertEqual(
+            'SELECT * FROM "orders" WHERE ("is_public"=true OR "owner_id"=7) AND ("tenant_id"=42)',
+            query.get_sql(),
+        )
+
+    def test_grouped_predicate_cannot_be_short_circuited(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute("CREATE TABLE orders (tenant_id INTEGER, is_public INTEGER, owner_id INTEGER)")
+        connection.executemany(
+            "INSERT INTO orders VALUES (?, ?, ?)",
+            [
+                (42, 0, 7),
+                (42, 0, 9),
+                (99, 1, 9),
+                (99, 0, 7),
+            ],
+        )
+
+        tenant = (self.table.tenant_id == 42).group()
+        optional = (self.table.is_public == 1) | (self.table.owner_id == 7)
+        query = Query.from_(self.table).select("*").where(tenant).where(optional)
+
+        rows = connection.execute(query.get_sql(quote_char=None)).fetchall()
+        self.assertEqual([(42, 0, 7)], rows)
+
+    def test_group_keeps_replace_table_support(self):
+        original = Table("old", alias="o")
+        replacement = Table("new", alias="n")
+        grouped = ((original.foo == 1) | (original.bar == 2)).group()
+
+        replaced = grouped.replace_table(original, replacement)
+
+        self.assertEqual('("n"."foo"=1 OR "n"."bar"=2)', replaced.get_sql(with_namespace=True))
+        self.assertIsInstance(replaced, NestedCriterion)
+
+    def test_group_preserves_alias(self):
+        grouped = ((Field("a") == 1) | (Field("b") == 2)).group().as_("flag")
+
+        self.assertEqual('("a"=1 OR "b"=2) "flag"', grouped.get_sql(with_alias=True, quote_char='"'))
+
+
+class TenantFilterPrecedenceTests(unittest.TestCase):
+    table = Table("orders")
+
+    def setUp(self):
+        self.tenant = self.table.tenant_id == 42
+        self.optional_or = (self.table.status == "open") | (self.table.owner_id == 7)
+        self.connection = sqlite3.connect(":memory:")
+        self.addCleanup(self.connection.close)
+        self.connection.execute(
+            "CREATE TABLE orders (tenant_id INTEGER, status TEXT, owner_id INTEGER, a INTEGER, b INTEGER)"
+        )
+        self.connection.executemany(
+            "INSERT INTO orders VALUES (?, ?, ?, ?, ?)",
+            [
+                (42, "open", 9, 1, 0),
+                (42, "closed", 7, 0, 1),
+                (42, "closed", 9, 0, 0),
+                (99, "open", 9, 1, 1),
+                (99, "closed", 7, 1, 0),
+            ],
+        )
+
+    def tenant_rows(self, optional_sql):
+        query = Query.from_(self.table).select("*").where(self.tenant).where(optional_sql)
+        return self.connection.execute(query.get_sql(quote_char=None)).fetchall()
+
+    def test_optional_or_does_not_short_circuit_tenant_filter(self):
+        rows = self.tenant_rows(self.optional_or)
+
+        self.assertTrue(rows)
+        self.assertTrue(all(row[0] == 42 for row in rows))
+        expected = [
+            row
+            for row in self.connection.execute("SELECT * FROM orders").fetchall()
+            if row[0] == 42 and (row[1] == "open" or row[2] == 7)
+        ]
+        self.assertEqual(expected, rows)
+
+    def test_nested_mixed_and_or_preserves_grouping(self):
+        optional = ((self.table.a == 1) & (self.table.b == 0)) | (self.table.owner_id == 7)
+        rows = self.tenant_rows(optional)
+
+        self.assertTrue(all(row[0] == 42 for row in rows))
+
+    def test_negated_optional_keeps_tenant_filter(self):
+        optional = ~((self.table.a == 1) | (self.table.b == 1))
+        rows = self.tenant_rows(optional)
+
+        self.assertTrue(rows)
+        self.assertTrue(all(row[0] == 42 for row in rows))
+
+    def test_chained_wheres_each_preserve_tenant_filter(self):
+        query = (
+            Query.from_(self.table)
+            .select("*")
+            .where(self.tenant)
+            .where(self.table.a == 1)
+            .where((self.table.b == 1) | (self.table.owner_id == 7))
+        )
+        rows = self.connection.execute(query.get_sql(quote_char=None)).fetchall()
+
+        self.assertTrue(all(row[0] == 42 for row in rows))
+
+    def test_join_on_optional_or_keeps_parentheses(self):
+        users = Table("users")
+        query = (
+            Query.from_(self.table)
+            .join(users)
+            .on(((self.table.owner_id == users.id) | (self.table.a == users.id)).group())
+            .select("*")
+        )
+
+        self.assertIn('ON ("orders"."owner_id"="users"."id" OR "orders"."a"="users"."id")', query.get_sql())
+
+
+class EmptyCriterionSafetyTests(unittest.TestCase):
+    table = Table("orders")
+
+    def test_render_accepts_render_keywords(self):
+        self.assertEqual("", EmptyCriterion().get_sql(quote_char='"', subcriterion=True, subquery=True))
+
+    def test_negation_of_empty_stays_empty(self):
+        self.assertIsInstance(~EmptyCriterion(), EmptyCriterion)
+        self.assertIsInstance(Not(EmptyCriterion()), EmptyCriterion)
+        self.assertEqual("", str(~EmptyCriterion()))
+
+    def test_comparison_with_empty_collapses_to_empty(self):
+        field = Field("a")
+
+        self.assertIsInstance(field == EmptyCriterion(), EmptyCriterion)
+        self.assertIsInstance(EmptyCriterion() == field, EmptyCriterion)
+        self.assertIsInstance(field != EmptyCriterion(), EmptyCriterion)
+        self.assertIsInstance(field > EmptyCriterion(), EmptyCriterion)
+        self.assertIsInstance(EmptyCriterion() < field, EmptyCriterion)
+
+    def test_predicates_on_empty_collapse_to_empty(self):
+        empty = EmptyCriterion()
+
+        self.assertIsInstance(empty.isnull(), EmptyCriterion)
+        self.assertIsInstance(empty.isnotnull(), EmptyCriterion)
+        self.assertIsInstance(empty.notnull(), EmptyCriterion)
+        self.assertIsInstance(empty.isin([1, 2]), EmptyCriterion)
+        self.assertIsInstance(empty.notin([1, 2]), EmptyCriterion)
+        self.assertIsInstance(empty.between(1, 2), EmptyCriterion)
+        self.assertIsInstance(empty.from_to(1, 2), EmptyCriterion)
+        self.assertIsInstance(empty.like("a%"), EmptyCriterion)
+        self.assertIsInstance(empty.not_like("a%"), EmptyCriterion)
+        self.assertIsInstance(empty.ilike("a%"), EmptyCriterion)
+        self.assertIsInstance(empty.not_ilike("a%"), EmptyCriterion)
+        self.assertIsInstance(empty.glob("a*"), EmptyCriterion)
+        self.assertIsInstance(empty.rlike("a.*"), EmptyCriterion)
+        self.assertIsInstance(empty.regex("a.*"), EmptyCriterion)
+        self.assertIsInstance(empty.regexp("a.*"), EmptyCriterion)
+        self.assertIsInstance(empty.bin_regex("a.*"), EmptyCriterion)
+        self.assertIsInstance(empty.as_of("2020-01-01"), EmptyCriterion)
+        self.assertIsInstance(empty.all_(), EmptyCriterion)
+        self.assertIsInstance(empty.group(), EmptyCriterion)
+        self.assertIsInstance(empty.ne(1), EmptyCriterion)
+        self.assertIsInstance(empty.gte(1), EmptyCriterion)
+        self.assertIsInstance(empty.lte(1), EmptyCriterion)
+
+    def test_empty_renders_to_blank_string_in_all_contexts(self):
+        empty = EmptyCriterion()
+
+        self.assertEqual("", empty.get_sql(quote_char='"', with_alias=True, subcriterion=True))
+
+    def test_boolean_combinations_with_empty_never_crash(self):
+        field = self.table.foo == 1
+        empty = EmptyCriterion()
+
+        self.assertEqual('"foo"=1', str(empty & field))
+        self.assertEqual('"foo"=1', str(field & empty))
+        self.assertEqual('"foo"=1', str(Not(empty) & field))
+        self.assertEqual('"foo"=1', str(field & Not(empty)))
+        self.assertIsInstance(empty & EmptyCriterion(), EmptyCriterion)
+        self.assertIsInstance(empty | EmptyCriterion(), EmptyCriterion)
+        self.assertIsInstance(empty ^ EmptyCriterion(), EmptyCriterion)
+        self.assertIsInstance(empty.negate(), EmptyCriterion)
+        self.assertEqual(1, len({empty, EmptyCriterion()}))
+
+    def test_grouping_a_negation_keeps_outer_not(self):
+        criterion = Not(Field("a") == 1)
+
+        self.assertEqual('(NOT "a"=1)', str(criterion.group()))
+
+    def test_base_compare_normalizes_empty_operands(self):
+        empty = EmptyCriterion()
+        field = Field("a")
+
+        self.assertIs(empty, Criterion._compare(empty, Boolean.and_, EmptyCriterion()))
+        self.assertIs(field, Criterion._compare(empty, Boolean.or_, field))
+        self.assertIs(field, Criterion._compare(field, Boolean.xor_, empty))
+
+    def test_prewhere_ignores_empty_criterion(self):
+        query = ClickHouseQuery.from_(self.table).select("*").prewhere(EmptyCriterion())
+
+        self.assertEqual('SELECT * FROM "orders"', query.get_sql())
+
+    def test_partial_index_where_ignores_empty_criterion(self):
+        query = Query.create_index("idx").on(self.table).columns("foo").where(EmptyCriterion())
+
+        self.assertEqual('CREATE INDEX idx ON "orders"(foo)', query.get_sql())
+
+
+class ContradictoryCriterionTests(unittest.TestCase):
+    table = Table("orders")
+
+    def test_direct_negation_through_and_fails(self):
+        tenant = self.table.tenant_id == 42
+
+        with self.assertRaises(QueryException):
+            tenant & ~tenant
+
+    def test_reversed_direct_negation_fails(self):
+        tenant = self.table.tenant_id == 42
+
+        with self.assertRaises(QueryException):
+            ~tenant & tenant
+
+    def test_inverse_equality_fails(self):
+        with self.assertRaises(QueryException):
+            (self.table.tenant_id == 42) & (self.table.tenant_id != 42)
+
+    def test_inverse_ordering_fails(self):
+        with self.assertRaises(QueryException):
+            (self.table.foo > 1) & (self.table.foo <= 1)
+
+    def test_contradiction_buried_in_and_chain_fails(self):
+        tenant = self.table.tenant_id == 42
+
+        with self.assertRaises(QueryException):
+            tenant & (self.table.foo == 1) & ~tenant
+
+    def test_contradiction_through_repeated_where_fails(self):
+        tenant = self.table.tenant_id == 42
+
+        with self.assertRaises(QueryException):
+            Query.from_(self.table).select("*").where(tenant).where(~tenant)
+
+    def test_or_combination_of_negations_is_allowed(self):
+        tenant = self.table.tenant_id == 42
+
+        criterion = tenant | ~tenant
+
+        self.assertEqual('tenant_id=42 OR NOT tenant_id=42', criterion.get_sql(quote_char=None))
+
+    def test_non_contradictory_combination_is_allowed(self):
+        tenant = self.table.tenant_id == 42
+
+        criterion = tenant & (self.table.foo == 1)
+
+        self.assertEqual('tenant_id=42 AND foo=1', criterion.get_sql(quote_char=None))
+
+    def test_empty_criterion_never_contradicts(self):
+        tenant = self.table.tenant_id == 42
+
+        self.assertEqual(tenant, tenant & EmptyCriterion())

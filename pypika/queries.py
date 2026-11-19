@@ -996,6 +996,9 @@ class QueryBuilder(Selectable, Term):
 
     @builder
     def prewhere(self, criterion: Criterion) -> None:
+        if isinstance(criterion, EmptyCriterion):
+            return
+
         if not self._validate_table(criterion):
             self._foreign_table = True
 
@@ -2202,6 +2205,9 @@ class CreateIndexBuilder:
         """
         Partial index where clause.
         """
+        if isinstance(criterion, EmptyCriterion):
+            return
+
         if self._wheres:
             self._wheres &= criterion
         else:

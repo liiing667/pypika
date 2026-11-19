@@ -10,7 +10,7 @@ from collections.abc import Callable, Iterable, Iterator, Sequence
 from datetime import date, datetime, time
 from enum import Enum
 from ipaddress import IPv4Address, IPv6Address
-from typing import TYPE_CHECKING, Any, TypeVar, overload
+from typing import TYPE_CHECKING, Any, TypeVar, cast, overload
 
 from pypika.enums import Arithmetic, Boolean, Comparator, Dialects, Equality, JSONOperators, Matching, Order
 from pypika.utils import (
@@ -328,23 +328,30 @@ class Term(Node):
     def __rrshift__(self, other: Any) -> ArithmeticExpression:
         return ArithmeticExpression(Arithmetic.rshift, self.wrap_constant(other), self)
 
-    def __eq__(self, other: Any) -> BasicCriterion:
-        return BasicCriterion(Equality.eq, self, self.wrap_constant(other))
+    def _comparison(self, comparator: Equality, other: Any) -> "BasicCriterion | EmptyCriterion":
+        # An empty operand contributes no predicate, so the comparison collapses to empty
+        # instead of serializing into malformed SQL such as ``"a"=``.
+        if isinstance(self, EmptyCriterion) or isinstance(other, EmptyCriterion):
+            return EmptyCriterion()
+        return BasicCriterion(comparator, self, self.wrap_constant(other))
 
-    def __ne__(self, other: Any) -> BasicCriterion:
-        return BasicCriterion(Equality.ne, self, self.wrap_constant(other))
+    def __eq__(self, other: Any) -> BasicCriterion:  # type: ignore[override]
+        return self._comparison(Equality.eq, other)  # type: ignore[return-value]
+
+    def __ne__(self, other: Any) -> BasicCriterion:  # type: ignore[override]
+        return self._comparison(Equality.ne, other)  # type: ignore[return-value]
 
     def __gt__(self, other: Any) -> BasicCriterion:
-        return BasicCriterion(Equality.gt, self, self.wrap_constant(other))
+        return self._comparison(Equality.gt, other)  # type: ignore[return-value]
 
     def __ge__(self, other: Any) -> BasicCriterion:
-        return BasicCriterion(Equality.gte, self, self.wrap_constant(other))
+        return self._comparison(Equality.gte, other)  # type: ignore[return-value]
 
     def __lt__(self, other: Any) -> BasicCriterion:
-        return BasicCriterion(Equality.lt, self, self.wrap_constant(other))
+        return self._comparison(Equality.lt, other)  # type: ignore[return-value]
 
     def __le__(self, other: Any) -> BasicCriterion:
-        return BasicCriterion(Equality.lte, self, self.wrap_constant(other))
+        return self._comparison(Equality.lte, other)  # type: ignore[return-value]
 
     def __getitem__(self, item: slice) -> BetweenCriterion:
         if not isinstance(item, slice):
@@ -473,7 +480,7 @@ class Negative(Term):
         self.term = term
 
     @property
-    def is_aggregate(self) -> bool | None:
+    def is_aggregate(self) -> bool | None:  # type: ignore[override]
         return self.term.is_aggregate
 
     def get_sql(self, with_alias: bool = False, **kwargs: Any) -> str:
@@ -680,8 +687,14 @@ class Criterion(Term):
     def _compare(self, comparator: Comparator, other: Any) -> ComplexCriterion: ...
 
     def _compare(self, comparator: Comparator, other: Any) -> Self | ComplexCriterion:
+        if isinstance(self, EmptyCriterion):
+            if isinstance(other, EmptyCriterion):
+                return self
+            return other
         if isinstance(other, EmptyCriterion):
             return self
+        if comparator == Boolean.and_ and isinstance(other, Criterion):
+            self.assert_no_contradiction(other)
         return ComplexCriterion(comparator, self, other)
 
     def __and__(self, other: Any) -> Self | ComplexCriterion:
@@ -693,12 +706,68 @@ class Criterion(Term):
     def __xor__(self, other: Any) -> Self | ComplexCriterion:
         return self._compare(Boolean.xor_, other)
 
+    def _negated_form(self) -> Criterion | None:
+        """
+        Return the logical negation of this criterion when it has an explicit, invertible form,
+        otherwise ``None``. The default implementation has no invertible form.
+        """
+        return None
+
+    def _contradicts(self, other: Criterion) -> bool:
+        """
+        Return ``True`` when combining this criterion with ``other`` through AND can never match
+        any row. Detection is intentionally limited to structurally obvious contradictions
+        (a criterion paired with its explicit negation) so that ordinary, non-contradictory query
+        building is never affected.
+        """
+        if isinstance(other, Not):
+            return self._is_structurally_equal(other.term)
+        own_negation = self._negated_form()
+        return own_negation is not None and own_negation._is_structurally_equal(other)
+
+    def _is_structurally_equal(self, other: Term) -> bool:
+        return type(self) is type(other) and self.get_sql() == other.get_sql()
+
+    def _conjuncts(self) -> list["Criterion"]:
+        """Flatten the criterion tree into its AND-combined components."""
+        return [self]
+
+    def assert_no_contradiction(self, other: Criterion) -> None:
+        """
+        Validate that combining this criterion tree with ``other`` through AND introduces no
+        structurally detectable contradiction. The check flattens both AND chains so that a
+        contradiction buried inside nested groups is still rejected.
+        """
+        if isinstance(other, EmptyCriterion):
+            return
+        existing = self._conjuncts()
+        incoming = other._conjuncts()
+        for left in existing:
+            for right in incoming:
+                if left._contradicts(right) or right._contradicts(left):
+                    raise QueryException(
+                        "Refusing to combine contradictory criteria with AND: "
+                        "'{left}' and '{right}' can never match together.".format(
+                            left=left.get_sql(), right=right.get_sql()
+                        )
+                    )
+
+    def group(self) -> NestedCriterion:
+        """
+        Wrap the criterion in explicit parentheses that are preserved in the term tree itself.
+
+        Grouping makes the boundary of a predicate explicit, which prevents optional conditions
+        from re-associating with a mandatory predicate (such as a tenant filter) when the two are
+        later combined through AND/OR/XOR.
+        """
+        return NestedCriterion(self, alias=getattr(self, "alias", None))
+
     @staticmethod
     def any(terms: Iterable[Term] = ()) -> EmptyCriterion | Term | ComplexCriterion:
         crit = EmptyCriterion()
 
         for term in terms:
-            crit |= term
+            crit |= term  # type: ignore[assignment]
 
         return crit
 
@@ -711,16 +780,19 @@ class Criterion(Term):
 
         return crit
 
-    def get_sql(self) -> str:
+    def get_sql(self, **kwargs: Any) -> str:
         raise NotImplementedError()
 
 
 class EmptyCriterion(Criterion):
-    is_aggregate = None
+    is_aggregate = None  # type: ignore[assignment]
     tables_ = set()
 
     def fields_(self) -> set[Field]:
         return set()
+
+    def nodes_(self) -> Iterator[NodeT]:
+        yield self  # type: ignore[misc]
 
     def __and__(self, other: T) -> T:
         return other
@@ -731,8 +803,92 @@ class EmptyCriterion(Criterion):
     def __xor__(self, other: T) -> T:
         return other
 
-    def __invert__(self) -> Self:
+    def __invert__(self) -> Self:  # type: ignore[override]
         return self
+
+    def __eq__(self, other: Any) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def __ne__(self, other: Any) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def __gt__(self, other: Any) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def __ge__(self, other: Any) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def __lt__(self, other: Any) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def __le__(self, other: Any) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def __hash__(self) -> int:
+        return hash(EmptyCriterion)
+
+    def isnull(self) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def isnotnull(self) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def notnull(self) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def isin(self, arg: Any) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def notin(self, arg: Any) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def between(self, lower: Any, upper: Any) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def from_to(self, start: Any, end: Any) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def like(self, expr: str) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def not_like(self, expr: str) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def ilike(self, expr: str) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def not_ilike(self, expr: str) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def glob(self, expr: str) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def rlike(self, expr: str) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def regex(self, pattern: str) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def regexp(self, pattern: str) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def bin_regex(self, pattern: str) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def as_of(self, expr: str) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def all_(self) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def group(self) -> "EmptyCriterion":  # type: ignore[override]
+        return self
+
+    def negate(self) -> Self:  # type: ignore[override]
+        return self
+
+    def get_sql(self, **kwargs: Any) -> str:
+        return ""
 
 
 class Field(Criterion, JSON):
@@ -921,31 +1077,29 @@ class Bracket(Tuple):
 
 
 class NestedCriterion(Criterion):
-    def __init__(
-        self,
-        comparator: Comparator,
-        nested_comparator: ComplexCriterion,
-        left: Any,
-        right: Any,
-        nested: Any,
-        alias: str | None = None,
-    ) -> None:
+    """
+    A criterion wrapped in explicit parentheses so that its internal grouping is preserved
+    regardless of the boolean precedence rules of the expression it is combined with.
+
+    The serialized SQL always surrounds :paramref:`term` with parentheses, which guarantees that
+    optional conditions cannot alter how a mandatory outer predicate (for example a tenant filter)
+    binds when the two are combined with AND/OR/XOR.
+    """
+
+    def __init__(self, term: Any, alias: str | None = None) -> None:
         super().__init__(alias)
-        self.left = left
-        self.comparator = comparator
-        self.nested_comparator = nested_comparator
-        self.right = right
-        self.nested = nested
+        self.term = term
 
     def nodes_(self) -> Iterator[NodeT]:
         yield self
-        yield from self.right.nodes_()
-        yield from self.left.nodes_()
-        yield from self.nested.nodes_()
+        yield from self.term.nodes_()
 
     @property
     def is_aggregate(self) -> bool | None:
-        return resolve_is_aggregate([term.is_aggregate for term in [self.left, self.right, self.nested]])
+        return self.term.is_aggregate
+
+    def _conjuncts(self) -> list[Criterion]:
+        return self.term._conjuncts()
 
     @builder
     def replace_table(self, current_table: Table | None, new_table: Table | None) -> None:
@@ -959,18 +1113,10 @@ class NestedCriterion(Criterion):
         :return:
             A copy of the criterion with the tables replaced.
         """
-        self.left = self.left.replace_table(current_table, new_table)
-        self.right = self.right.replace_table(current_table, new_table)
-        self.nested = self.right.replace_table(current_table, new_table)
+        self.term = self.term.replace_table(current_table, new_table)
 
     def get_sql(self, with_alias: bool = False, **kwargs: Any) -> str:
-        sql = "{left}{comparator}{right}{nested_comparator}{nested}".format(
-            left=self.left.get_sql(**kwargs),
-            comparator=self.comparator.value,
-            right=self.right.get_sql(**kwargs),
-            nested_comparator=self.nested_comparator.value,
-            nested=self.nested.get_sql(**kwargs),
-        )
+        sql = "({term})".format(term=self.term.get_sql(**kwargs))
 
         if with_alias:
             return format_alias_sql(sql=sql, alias=self.alias, **kwargs)
@@ -1006,6 +1152,21 @@ class BasicCriterion(Criterion):
     @property
     def is_aggregate(self) -> bool | None:
         return resolve_is_aggregate([term.is_aggregate for term in [self.left, self.right]])
+
+    _inverse_equality = {
+        Equality.eq: Equality.ne,
+        Equality.ne: Equality.eq,
+        Equality.gt: Equality.lte,
+        Equality.lte: Equality.gt,
+        Equality.gte: Equality.lt,
+        Equality.lt: Equality.gte,
+    }
+
+    def _negated_form(self) -> Criterion | None:
+        inverse = self._inverse_equality.get(cast(Equality, self.comparator))
+        if inverse is None:
+            return None
+        return BasicCriterion(inverse, self.left, self.right, alias=self.alias)
 
     @builder
     def replace_table(self, current_table: Table | None, new_table: Table | None) -> None:
@@ -1266,6 +1427,11 @@ class NotNullCriterion(NullCriterion):
 
 
 class ComplexCriterion(BasicCriterion):
+    def _conjuncts(self) -> list[Criterion]:
+        if self.comparator == Boolean.and_:
+            return [*cast(Criterion, self.left)._conjuncts(), *cast(Criterion, self.right)._conjuncts()]
+        return [self]
+
     def get_sql(self, subcriterion: bool = False, **kwargs: Any) -> str:
         sql = "{left} {comparator} {right}".format(
             comparator=self.comparator.value,
@@ -1279,7 +1445,27 @@ class ComplexCriterion(BasicCriterion):
         return sql
 
     def needs_brackets(self, term: Term) -> bool:
-        return isinstance(term, ComplexCriterion) and not term.comparator == self.comparator
+        # Explicit grouping wrappers always render their own parentheses, so the outer
+        # expression must not add a second pair.
+        if isinstance(term, NestedCriterion):
+            return False
+        # A nested boolean expression only needs parentheses when its operator would otherwise
+        # bind differently once inlined into the outer expression. SQL boolean precedence is
+        # NOT < AND < XOR < OR, so any change of operator (including AND/OR/XOR mixes) changes
+        # the grouping and requires parentheses; same-operator chains are associative and stay
+        # unparenthesized to preserve the historical SQL output.
+        return isinstance(term, ComplexCriterion) and term.comparator != self.comparator
+
+    def group(self) -> NestedCriterion:
+        """
+        Wrap the compound criterion in explicit parentheses.
+
+        The wrapper is retained in the term tree (not only in the serialized SQL), so combining
+        the result with further AND/OR/XOR criteria can never flatten or re-associate it. This is
+        the building block for enforcing mandatory predicates (e.g. tenant filters) alongside
+        caller-supplied optional conditions.
+        """
+        return NestedCriterion(self, alias=self.alias)
 
 
 class ArithmeticExpression(Term):
@@ -1477,11 +1663,27 @@ class Not(Criterion):
         super().__init__(alias=alias)
         self.term = term
 
+    def group(self) -> NestedCriterion:
+        return NestedCriterion(self, alias=self.alias)
+
+    def __new__(cls, term: Any = None, alias: str | None = None) -> "Not | EmptyCriterion":  # type: ignore[misc]
+        # ``term`` defaults to ``None`` because the immutable ``@builder`` copy path reconstructs
+        # instances through ``cls.__new__(cls)`` without constructor arguments.
+        if isinstance(term, EmptyCriterion):
+            return term
+        return super().__new__(cls)
+
     def nodes_(self) -> Iterator[NodeT]:
         yield self
         yield from self.term.nodes_()
 
+    @property
+    def is_aggregate(self) -> bool | None:
+        return self.term.is_aggregate
+
     def get_sql(self, **kwargs: Any) -> str:
+        if isinstance(self.term, EmptyCriterion):
+            return self.term.get_sql(**kwargs)
         kwargs["subcriterion"] = True
         sql = "NOT {term}".format(term=self.term.get_sql(**kwargs))
         return format_alias_sql(sql, self.alias, **kwargs)
