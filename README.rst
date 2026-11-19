@@ -1257,6 +1257,12 @@ MSSQL:
 
 You can find out what parameter style is needed for DBAPI compliant drivers here: https://www.python.org/dev/peps/pep-0249/#paramstyle or in the DB driver documentation.
 
+Placeholders are validated against the DB-API token grammar, so a caller supplied string can never break out of
+the placeholder boundary. Input containing statement separators (``;``), newlines, whitespace, quotes or any other
+content outside the chosen paramstyle raises ``pypika.utils.ParameterException`` when the parameter is built (or when
+the SQL is generated for dynamically produced placeholders), instead of being written into the query. Each specialized
+type only accepts its own paramstyle, e.g. ``NamedParameter(':1')`` is rejected because ``:1`` is a numeric token.
+
 Extracting Parameter Values
 """""""""""""""""""""""""""
 

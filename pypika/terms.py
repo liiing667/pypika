@@ -16,6 +16,7 @@ from pypika.enums import Arithmetic, Boolean, Comparator, Dialects, Equality, JS
 from pypika.utils import (
     CaseException,
     FunctionException,
+    ParameterException,
     QueryException,
     builder,
     escape_backslashes,
@@ -369,19 +370,89 @@ def named_placeholder_gen(idx: int) -> str:
     return f'param{idx + 1}'
 
 
+# A single DB-API (PEP 249) parameter token. Placeholders must match one of the
+# supported paramstyles exactly: qmark ("?"), numeric (":1"), named (":name"),
+# format ("%s") or pyformat ("%(name)s"). Anything outside this grammar - a
+# statement separator, a newline, a quote, extra SQL ... - is rejected so caller
+# supplied strings can never escape the placeholder boundary.
+PARAMSTYLE_PATTERNS = {
+    "qmark": re.compile(r"^\?$"),
+    "numeric": re.compile(r"^:[1-9][0-9]*$"),
+    "named": re.compile(r"^:[A-Za-z_][A-Za-z0-9_]*$"),
+    "format": re.compile(r"^%s$"),
+    "pyformat": re.compile(r"^%\([A-Za-z_][A-Za-z0-9_]*\)s$"),
+}
+
+
+def validate_parameter_token(placeholder: str, paramstyle: str) -> str:
+    pattern = PARAMSTYLE_PATTERNS[paramstyle]
+    if pattern.fullmatch(placeholder) is None:
+        raise ParameterException(
+            f"Invalid {paramstyle} parameter placeholder {placeholder!r}: a parameter must be a single "
+            "DB-API (PEP 249) token and cannot contain statement separators, whitespace or other SQL"
+        )
+    return placeholder
+
+
+def render_placeholder(
+    placeholder: str | int | Callable[[int], str],
+    param_count: int,
+    paramstyle: str,
+    normalize: Callable[[str], str] | None = None,
+) -> str:
+    if callable(placeholder):
+        token = str(placeholder(param_count))
+    else:
+        token = str(placeholder)
+    if normalize is not None:
+        token = normalize(token)
+    return _validate_stored_token(token, paramstyle)
+
+
+def _validate_stored_token(token: str, paramstyle: str | None) -> str:
+    if paramstyle is None:
+        if not any(pattern.fullmatch(token) for pattern in PARAMSTYLE_PATTERNS.values()):
+            raise ParameterException(
+                f"Invalid parameter placeholder {token!r}: a parameter must be a single DB-API (PEP 249) "
+                "token and cannot contain statement separators, whitespace or other SQL"
+            )
+        return token
+    return validate_parameter_token(token, paramstyle)
+
+
 class Parameter(Term):
+    """A fixed DB-API (PEP 249) parameter token written into the SQL.
+
+    The placeholder is validated against the supported paramstyles, so a caller
+    supplied string can never break out of the placeholder boundary. Subclasses
+    restrict the token to their own paramstyle via ``_paramstyle``.
+    """
+
     is_aggregate = None
+
+    _paramstyle = None
 
     def __init__(self, placeholder: str | int) -> None:
         super().__init__()
-        self._placeholder = placeholder
+        self._placeholder = self._validate(placeholder)
+
+    def _normalize_token(self, token: str) -> str:
+        return token
+
+    def _validate(self, placeholder: str | int) -> str:
+        if isinstance(placeholder, bool) or not isinstance(placeholder, (str, int)):
+            raise ParameterException(
+                f"Invalid parameter placeholder {placeholder!r}: expected a str or int DB-API (PEP 249) token"
+            )
+        return _validate_stored_token(self._normalize_token(str(placeholder)), self._paramstyle)
 
     @property
     def placeholder(self):
         return self._placeholder
 
     def get_sql(self, **kwargs: Any) -> str:
-        return str(self.placeholder)
+        # Re-validate on render as defense in depth.
+        return _validate_stored_token(str(self.placeholder), self._paramstyle)
 
     def update_parameters(self, param_key: Any, param_value: Any, **kwargs) -> None:
         pass
@@ -391,16 +462,26 @@ class Parameter(Term):
 
 
 class ListParameter(Parameter):
+    """Base for positional parameters whose values are collected in a list.
+
+    A callable placeholder generator is supported for positional numbering; its
+    output is validated against the subclass paramstyle every time it renders.
+    """
+
     def __init__(self, placeholder: str | int | Callable[[int], str] = idx_placeholder_gen) -> None:
-        super().__init__(placeholder=placeholder)
+        if callable(placeholder):
+            Term.__init__(self)
+            self._placeholder = placeholder
+        else:
+            super().__init__(placeholder=placeholder)
         self._parameters = list()
 
     @property
     def placeholder(self) -> str:
         if callable(self._placeholder):
-            return self._placeholder(len(self._parameters))
+            return render_placeholder(self._placeholder, len(self._parameters), self._paramstyle, self._normalize_token)
 
-        return str(self._placeholder)
+        return _validate_stored_token(str(self._placeholder), self._paramstyle)
 
     def get_parameters(self, **kwargs) -> list:
         return self._parameters
@@ -410,16 +491,22 @@ class ListParameter(Parameter):
 
 
 class DictParameter(Parameter):
+    """Base for named parameters whose values are collected in a dict."""
+
     def __init__(self, placeholder: str | int | Callable[[int], str] = named_placeholder_gen) -> None:
-        super().__init__(placeholder=placeholder)
+        if callable(placeholder):
+            Term.__init__(self)
+            self._placeholder = placeholder
+        else:
+            super().__init__(placeholder=placeholder)
         self._parameters = dict()
 
     @property
     def placeholder(self) -> str:
         if callable(self._placeholder):
-            return self._placeholder(len(self._parameters))
+            return render_placeholder(self._placeholder, len(self._parameters), self._paramstyle, self._normalize_token)
 
-        return str(self._placeholder)
+        return _validate_stored_token(str(self._placeholder), self._paramstyle)
 
     def get_parameters(self, **kwargs) -> dict:
         return self._parameters
@@ -428,40 +515,72 @@ class DictParameter(Parameter):
         return placeholder[1:]
 
     def update_parameters(self, param_key: Any, value: Any, **kwargs) -> None:
+        if param_key in self._parameters and self._parameters[param_key] != value:
+            raise ParameterException(
+                f"Named parameter {param_key!r} is bound to conflicting values: "
+                f"{self._parameters[param_key]!r} and {value!r}"
+            )
         self._parameters[param_key] = value
 
 
 class QmarkParameter(ListParameter):
+    _paramstyle = "qmark"
+
+    def __init__(self, placeholder: str | int | Callable[[int], str] = "?") -> None:
+        super().__init__(placeholder=placeholder)
+
     def get_sql(self, **kwargs) -> str:
-        return '?'
+        validate_parameter_token(self.placeholder, self._paramstyle)
+        return "?"
 
 
 class NumericParameter(ListParameter):
     """Numeric, positional style, e.g. ...WHERE name=:1"""
 
+    _paramstyle = "numeric"
+
+    def _normalize_token(self, token: str) -> str:
+        return token if token.startswith(":") else f":{token}"
+
     def get_sql(self, **kwargs: Any) -> str:
-        return ":{placeholder}".format(placeholder=self.placeholder)
+        return validate_parameter_token(self.placeholder, self._paramstyle)
 
 
 class FormatParameter(ListParameter):
     """ANSI C printf format codes, e.g. ...WHERE name=%s"""
 
+    _paramstyle = "format"
+
+    def __init__(self, placeholder: str | int | Callable[[int], str] = "%s") -> None:
+        super().__init__(placeholder=placeholder)
+
     def get_sql(self, **kwargs: Any) -> str:
+        validate_parameter_token(self.placeholder, self._paramstyle)
         return "%s"
 
 
 class NamedParameter(DictParameter):
     """Named style, e.g. ...WHERE name=:name"""
 
+    _paramstyle = "named"
+
+    def _normalize_token(self, token: str) -> str:
+        return token if token.startswith(":") else f":{token}"
+
     def get_sql(self, **kwargs: Any) -> str:
-        return ":{placeholder}".format(placeholder=self.placeholder)
+        return validate_parameter_token(self.placeholder, self._paramstyle)
 
 
 class PyformatParameter(DictParameter):
     """Python extended format codes, e.g. ...WHERE name=%(name)s"""
 
+    _paramstyle = "pyformat"
+
+    def _normalize_token(self, token: str) -> str:
+        return token if token.startswith("%(") else f"%({token})s"
+
     def get_sql(self, **kwargs: Any) -> str:
-        return "%({placeholder})s".format(placeholder=self.placeholder)
+        return validate_parameter_token(self.placeholder, self._paramstyle)
 
     def get_param_key(self, placeholder: T, **kwargs) -> T:
         return placeholder[2:-2]

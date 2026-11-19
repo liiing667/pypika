@@ -1,6 +1,8 @@
 import unittest
 from datetime import date
 
+import pytest
+
 from pypika import (
     FormatParameter,
     NamedParameter,
@@ -13,7 +15,8 @@ from pypika import (
     Tables,
 )
 from pypika.dialects import ClickHouseQuery, MySQLQuery
-from pypika.terms import ListParameter, ParameterValueWrapper
+from pypika.terms import DictParameter, ListParameter, ParameterValueWrapper
+from pypika.utils import ParameterException
 
 
 class ParametrizedTests(unittest.TestCase):
@@ -44,19 +47,19 @@ class ParametrizedTests(unittest.TestCase):
         q = (
             Query.from_(self.table_abc)
             .select("*")
-            .where(self.table_abc.category == Parameter("&1"))
+            .where(self.table_abc.category == Parameter(":1"))
             .where(
                 self.table_abc.id.isin(
                     Query.from_(self.table_efg)
                     .select(self.table_efg.abc_id)
-                    .where(self.table_efg.date >= Parameter("&2"))
+                    .where(self.table_efg.date >= Parameter(":2"))
                 )
             )
             .limit(10)
         )
 
         self.assertEqual(
-            'SELECT * FROM "abc" WHERE "category"=&1 AND "id" IN (SELECT "abc_id" FROM "efg" WHERE "date">=&2) LIMIT 10',
+            'SELECT * FROM "abc" WHERE "category"=:1 AND "id" IN (SELECT "abc_id" FROM "efg" WHERE "date">=:2) LIMIT 10',
             q.get_sql(),
         )
 
@@ -143,10 +146,10 @@ class ParametrizedTestsWithValues(unittest.TestCase):
             .limit(10)
         )
 
-        parameter = ListParameter(placeholder=lambda idx: f'&{idx+1}')
+        parameter = NumericParameter(placeholder=lambda idx: idx + 1)
         sql = q.get_sql(parameter=parameter)
         self.assertEqual(
-            'SELECT * FROM "abc" WHERE "category"=&1 AND "id" IN (SELECT "abc_id" FROM "efg" WHERE "date">=&2) LIMIT 10',
+            'SELECT * FROM "abc" WHERE "category"=:1 AND "id" IN (SELECT "abc_id" FROM "efg" WHERE "date">=:2) LIMIT 10',
             sql,
         )
         self.assertEqual(['foobar', '2024-02-22'], parameter.get_parameters())
@@ -246,3 +249,180 @@ class ParametrizedBackslashTests(unittest.TestCase):
         q = MySQLQuery.update(Table("t")).set("col", "a\\b")
 
         self.assertEqual("UPDATE `t` SET `col`='a\\\\b'", q.get_sql())
+
+
+# Inputs that must never be accepted as a placeholder: they contain a statement
+# separator, whitespace/newline, quotes or SQL comment markers and would let a
+# caller supplied string break out of the placeholder boundary.
+MALICIOUS_PLACEHOLDERS = [
+    "?; DELETE FROM users",
+    "?\nDELETE FROM users",
+    ":1; DROP TABLE t",
+    ":name; DELETE FROM t",
+    "%s; DELETE FROM t",
+    "%(name)s; DELETE FROM t",
+    "1; DELETE FROM t",
+    "name\n--",
+    "' OR '1'='1",
+    "1 --",
+    ":1/*comment*/",
+    "",
+]
+
+PARAMETER_CLASSES = [
+    Parameter,
+    QmarkParameter,
+    NumericParameter,
+    NamedParameter,
+    FormatParameter,
+    PyformatParameter,
+]
+
+
+class TestParameterInjection:
+    """pytest parameterized acceptance tests for placeholder boundary hardening."""
+
+    @pytest.mark.parametrize("parameter_cls", PARAMETER_CLASSES)
+    @pytest.mark.parametrize("placeholder", MALICIOUS_PLACEHOLDERS)
+    def test_malicious_placeholder_rejected_at_construction(self, parameter_cls, placeholder):
+        with pytest.raises(ParameterException):
+            parameter_cls(placeholder)
+
+    @pytest.mark.parametrize("parameter_cls", PARAMETER_CLASSES)
+    @pytest.mark.parametrize("placeholder", MALICIOUS_PLACEHOLDERS)
+    def test_malicious_placeholder_never_rendered(self, parameter_cls, placeholder):
+        with pytest.raises(ParameterException):
+            parameter_cls(placeholder).get_sql()
+
+    @pytest.mark.parametrize("parameter_cls", PARAMETER_CLASSES)
+    @pytest.mark.parametrize(
+        "placeholder",
+        [
+            "?; DELETE FROM users",
+            "?\nDELETE FROM users",
+            ":1; SELECT 1",
+            ":name; SELECT 1",
+            "%s; SELECT 1",
+            "%(name)s; SELECT 1",
+        ],
+    )
+    def test_multi_statement_input_fails_during_query_generation(self, parameter_cls, placeholder):
+        table = Table("abc")
+        with pytest.raises(ParameterException):
+            Query.from_(table).select("*").where(table.category == parameter_cls(placeholder)).get_sql()
+
+    @pytest.mark.parametrize(
+        ("parameter_cls", "placeholder"),
+        [
+            (QmarkParameter, ":1"),
+            (QmarkParameter, "%s"),
+            (NumericParameter, ":name"),
+            (NumericParameter, "?"),
+            (NamedParameter, ":1"),
+            (NamedParameter, "%(name)s"),
+            (FormatParameter, "?"),
+            (FormatParameter, ":name"),
+            (PyformatParameter, ":name"),
+            (PyformatParameter, "%s"),
+        ],
+    )
+    def test_paramstyle_conflict_rejected(self, parameter_cls, placeholder):
+        with pytest.raises(ParameterException):
+            parameter_cls(placeholder)
+
+    @pytest.mark.parametrize(
+        ("parameter_cls", "placeholder", "expected_sql"),
+        [
+            (QmarkParameter, "?", "?"),
+            (NumericParameter, 14, ":14"),
+            (NumericParameter, "14", ":14"),
+            (NumericParameter, ":15", ":15"),
+            (NamedParameter, "buz", ":buz"),
+            (NamedParameter, ":buz", ":buz"),
+            (FormatParameter, "%s", "%s"),
+            (PyformatParameter, "buz", "%(buz)s"),
+            (PyformatParameter, "%(buz)s", "%(buz)s"),
+        ],
+    )
+    def test_legal_tokens_render_unchanged(self, parameter_cls, placeholder, expected_sql):
+        assert parameter_cls(placeholder).get_sql() == expected_sql
+
+    @pytest.mark.parametrize(
+        ("parameter_cls", "expected_sql", "expected_params"),
+        [
+            (QmarkParameter, "?,?", [1, "foo"]),
+            (FormatParameter, "%s,%s", [1, "foo"]),
+            (NamedParameter, ":param1,:param2", {"param1": 1, "param2": "foo"}),
+            (PyformatParameter, "%(param1)s,%(param2)s", {"param1": 1, "param2": "foo"}),
+        ],
+    )
+    def test_legal_parameter_collection_preserved(self, parameter_cls, expected_sql, expected_params):
+        table = Table("abc")
+        query = Query.into(table).columns("a", "b").insert(1, "foo")
+        parameter = parameter_cls()
+
+        sql = query.get_sql(parameter=parameter)
+
+        assert sql == f'INSERT INTO "abc" ("a","b") VALUES ({expected_sql})'
+        assert parameter.get_parameters() == expected_params
+
+    def test_numeric_generator_collection_preserved(self):
+        table = Table("abc")
+        query = Query.from_(table).select("*").where(table.category == "foobar").where(table.id >= 2)
+        parameter = NumericParameter(placeholder=lambda idx: idx + 1)
+
+        sql = query.get_sql(parameter=parameter)
+
+        assert sql == 'SELECT * FROM "abc" WHERE "category"=:1 AND "id">=:2'
+        assert parameter.get_parameters() == ["foobar", 2]
+
+    def test_malicious_generator_output_rejected_at_render(self):
+        parameter = NumericParameter(placeholder=lambda idx: f"{idx + 1}; DELETE FROM t")
+
+        with pytest.raises(ParameterException):
+            parameter.placeholder
+
+    @pytest.mark.parametrize("parameter_cls", [QmarkParameter, FormatParameter])
+    def test_non_string_placeholder_rejected(self, parameter_cls):
+        with pytest.raises(ParameterException):
+            parameter_cls(["?"])
+
+    def test_named_parameter_conflicting_values_fail(self):
+        parameter = NamedParameter("p")
+        parameter.update_parameters(param_key="p", value=1)
+
+        with pytest.raises(ParameterException):
+            parameter.update_parameters(param_key="p", value=2)
+
+    def test_named_parameter_repeated_placeholder_keeps_value(self):
+        table = Table("abc")
+        parameter = NamedParameter("p")
+        Query.from_(table).select("*").where(table.a == "v").where(table.b == "v").get_sql(parameter=parameter)
+
+        assert parameter.get_parameters() == {"p": "v"}
+
+
+class ListParameterCompatibilityTests(unittest.TestCase):
+    def test_generic_list_generator_must_emit_full_token(self):
+        parameter = ListParameter(placeholder=lambda idx: f":{idx + 1}")
+        self.assertEqual(":1", parameter.placeholder)
+
+    def test_generic_list_rejects_bare_generator_output(self):
+        # The built-in generator emits a bare digit; only the numeric subclass can
+        # turn it into a valid ":n" token, the generic base must not render it raw.
+        with self.assertRaises(ParameterException):
+            ListParameter().placeholder
+
+    def test_generic_list_static_placeholder_is_validated(self):
+        self.assertEqual("?", ListParameter("?").get_sql())
+        with self.assertRaises(ParameterException):
+            ListParameter("?; DELETE FROM t").get_sql()
+
+    def test_generic_dict_rejects_bare_generator_output(self):
+        with self.assertRaises(ParameterException):
+            DictParameter().placeholder
+
+    def test_generic_dict_static_placeholder_is_validated(self):
+        self.assertEqual(":buz", DictParameter(":buz").get_sql())
+        with self.assertRaises(ParameterException):
+            DictParameter(":buz; DELETE FROM t").get_sql()
